@@ -3,6 +3,7 @@ import Quiz from '../models/Quiz.js';
 import Reward from '../models/Reward.js';
 import User from '../models/User.js';
 
+
 // @desc    Create a new course
 // @route   POST /api/courses
 // @access  Private (Teachers and Admins only)
@@ -123,15 +124,22 @@ export const createCourse = async (req, res) => {
     });
 
     // Update quizzes with the course reference
-    await Promise.all(
-      course.units.flatMap(unit => 
-        unit.lessons.flatMap(lesson => 
-          lesson.quizzes.map(quizId => 
-            Quiz.findByIdAndUpdate(quizId, { course: course._id })
-          )
-        )
-      )
+    
+    console.log("Course Units", course.units)
+    
+ const updatePromises = Array.from(course.units || []).reduce((unitAcc, unit) => {
+  const lessonUpdates = Array.from(unit.lessons || []).reduce((lessonAcc, lesson) => {
+    const quizUpdates = Array.from(lesson.quizzes || []).map(quizId =>
+      Quiz.findByIdAndUpdate(quizId, { course: course._id })
     );
+    return lessonAcc.concat(quizUpdates);
+  }, []);
+  return unitAcc.concat(lessonUpdates);
+}, []);
+
+await Promise.all(updatePromises);
+
+
 
     res.status(201).json({
       success: true,
@@ -176,7 +184,7 @@ export const getAllCourses = async (req, res) => {
     if (level) {
       query.level = level;
     }
-
+   query.creator = { $exists: true, $ne: null };
     // Search by title or description
     if (search) {
       query.$or = [
@@ -186,13 +194,17 @@ export const getAllCourses = async (req, res) => {
     }
 
     const courses = await Course.find(query)
-      .populate('creator', 'name email')
+      .populate({
+        path: 'creator',
+        select: 'name email',
+        match: { _id: { $exists: true } } // Ensure only existing creators are populated
+      })
       .sort({ createdAt: -1 });
-
-    res.json({
+ const validCourses = courses.filter(course => course.creator !== null);
+   res.json({
       success: true,
-      count: courses.length,
-      courses,
+      count: validCourses.length,
+      courses: validCourses,
     });
   } catch (error) {
     console.error(error);
@@ -265,7 +277,7 @@ export const updateCourse = async (req, res) => {
       });
     }
 
-    // Update course fields
+    // Update basic course fields
     course.title = req.body.title || course.title;
     course.description = req.body.description || course.description;
     course.subject = req.body.subject || course.subject;
@@ -273,30 +285,68 @@ export const updateCourse = async (req, res) => {
     course.imageUrl = req.body.imageUrl || course.imageUrl;
     course.level = req.body.level || course.level;
     course.isPublished = req.body.isPublished !== undefined ? req.body.isPublished : course.isPublished;
-
-    // Update units if provided
-    if (req.body.units) {
-      course.units = req.body.units;
-    }
-
-    // Update tags if provided
-    if (req.body.tags) {
-      course.tags = req.body.tags;
-    }
+    course.tags = req.body.tags || course.tags;
 
     // Update gamification settings if provided
     if (req.body.gamification) {
-      course.gamification.hasPersonalization =
-        req.body.gamification.hasPersonalization !== undefined
-          ? req.body.gamification.hasPersonalization
-          : course.gamification.hasPersonalization;
+      course.gamification = {
+        hasPersonalization: req.body.gamification.hasPersonalization !== undefined 
+          ? req.body.gamification.hasPersonalization 
+          : course.gamification.hasPersonalization,
+        pointsToEarn: req.body.gamification.pointsToEarn || course.gamification.pointsToEarn,
+        rewardsAvailable: req.body.gamification.rewardsAvailable || course.gamification.rewardsAvailable
+      };
+    }
 
-      course.gamification.pointsToEarn =
-        req.body.gamification.pointsToEarn || course.gamification.pointsToEarn;
-
-      if (req.body.gamification.rewardsAvailable) {
-        course.gamification.rewardsAvailable = req.body.gamification.rewardsAvailable;
-      }
+    // Handle units and quizzes updates
+    if (req.body.units) {
+      const updatedUnits = await Promise.all(
+        req.body.units.map(async (unit) => {
+          const updatedLessons = await Promise.all(
+            (unit.lessons || []).map(async (lesson) => {
+              if (lesson.quizzes && lesson.quizzes.length > 0) {
+                const updatedQuizzes = await Promise.all(
+                  lesson.quizzes.map(async (quiz) => {
+                    // If quiz has _id, it exists - update it
+                    if (quiz._id) {
+                      const updatedQuiz = await Quiz.findByIdAndUpdate(
+                        quiz._id,
+                        {
+                          title: quiz.title,
+                          questions: quiz.questions,
+                          passingScore: quiz.passingScore,
+                          timeLimit: quiz.timeLimit,
+                          maxAttempts: quiz.maxAttempts
+                        },
+                        { new: true }
+                      );
+                      return updatedQuiz._id;
+                    } else {
+                      // Create new quiz
+                      const newQuiz = await Quiz.create({
+                        ...quiz,
+                        course: course._id,
+                        creator: req.user._id
+                      });
+                      return newQuiz._id;
+                    }
+                  })
+                );
+                return {
+                  ...lesson,
+                  quizzes: updatedQuizzes
+                };
+              }
+              return lesson;
+            })
+          );
+          return {
+            ...unit,
+            lessons: updatedLessons
+          };
+        })
+      );
+      course.units = updatedUnits;
     }
 
     const updatedCourse = await course.save();
@@ -513,10 +563,16 @@ export const getEnrolledCourses = async (req, res) => {
     const user = await User.findById(req.user._id)
       .populate({
         path: 'enrolledCourses.course',
-        select: 'title description subject grade imageUrl units level',
+        select: 'title description subject grade imageUrl units level isPublished creator',
+        match: { 
+          _id: { $exists: true }, // Only populate if course exists
+          isPublished: true,      // Optional: only include published courses
+          creator: { $exists: true, $ne: null } // Ensure creator exists
+        },
         populate: {
           path: 'creator',
           select: 'name email',
+          match: { _id: { $exists: true } } // Only populate if creator exists
         },
       });
 
@@ -527,10 +583,18 @@ export const getEnrolledCourses = async (req, res) => {
       });
     }
 
+    // Filter out any enrolledCourses where:
+    // - course is null (was deleted)
+    // - or course.creator is null (creator was deleted)
+    const validEnrolledCourses = user.enrolledCourses.filter(ec => 
+      ec.course !== null && 
+      ec.course.creator !== null
+    );
+
     res.json({
       success: true,
-      count: user.enrolledCourses.length,
-      enrolledCourses: user.enrolledCourses,
+      count: validEnrolledCourses.length,
+      enrolledCourses: validEnrolledCourses,
     });
   } catch (error) {
     console.error(error);
@@ -810,17 +874,17 @@ export const updateCourseProgress = async (req, res) => {
     enrollment.progress = progressPercentage;
     const isCourseCompleted = progressPercentage === 100;
     enrollment.isCompleted = isCourseCompleted;
-
+ if (!user.completedLessons) {
+        user.completedLessons = [];
+      }
     // Award points for completing a lesson (if not already completed)
     let pointsToAward = 0;
-    if (completed && !user.completedLessons?.includes(lessonId)) {
+    if (completed && user.completedLessons && user.completedLessons.length > 0 && !user.completedLessons.includes(lessonId)) {
       pointsToAward = 5; // Base points for completing a lesson
       user.points += pointsToAward;
 
       // Track completed lessons at user level
-      if (!user.completedLessons) {
-        user.completedLessons = [];
-      }
+     
       user.completedLessons.push(lessonId);
 
       // Check for level up
@@ -854,7 +918,6 @@ export const updateCourseProgress = async (req, res) => {
     const completionRewards = isCourseCompleted 
       ? await Reward.find({
           'criteria.type': 'course-completion',
-          'criteria.courseId': courseId,
           'criteria.threshold': { $lte: progressPercentage },
           isActive: true
         })
